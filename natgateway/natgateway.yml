@@ -1,0 +1,34 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NAT Gateway.'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Network'
+      Parameters:
+      - RouteTablePrivate
+      - PublicSubnetA
+Parameters:
+  RouteTablePrivate:
+    Description: 'Private Route Table in the VPC'
+    Type: String
+  PublicSubnetA:
+    Description: 'Public SubnetA where NAT may live'
+    Type: AWS::EC2::Subnet::Id
+Resources:
+  EIP:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      Domain: vpc
+  NAT:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+  Route:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT

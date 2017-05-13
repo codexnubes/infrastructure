@@ -1,0 +1,623 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Highly available SSH bastion host/instance using IAM users for access and recording all session activity'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Network'
+      Parameters:
+      - VPC
+      - SubnetA
+      - SubnetB
+      - HomeNetwork
+    - Label:
+        default: 'EC2 Parameters'
+      Parameters:
+      - InstanceType
+      - KeyName
+      - LogsRetentionInDays
+    - Label:
+        default: 'Domain Parameters'
+      Parameters:
+      - HostedZone
+      - DomainName
+Parameters:
+  VPC:
+    Description: 'VPC location of the bastion host.'
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Description: 'Public SubnetA where NAT may live'
+    Type: AWS::EC2::Subnet::Id
+  SubnetB:
+    Description: 'Public SubnetB where NAT may live'
+    Type: AWS::EC2::Subnet::Id
+  HomeNetwork:
+    Description: 'Home or remote network range requiring access for ssh'
+    Type: String
+    Default: 24.0.0.0/8
+  KeyName:
+    Description: 'Optional key pair of the ec2-user to establish a SSH connection to the SSH bastion host/instance.'
+    Type: String
+    Default: ''
+  InstanceType:
+    Description: 'Instance type of the SSH bastion host/instance.'
+    Type: String
+    Default: 'm3.medium'
+  LogsRetentionInDays:
+    Description: 'Specifies the number of days you want to retain log events.'
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 7, 30, 60, 90, 120, 365]
+  AMI:
+    Description: 'Amazon Linux AMI'
+    Type: String
+    Default: ami-c58c1dd3
+  HostedZone:
+    Description: 'Route53 Hosted Zone'
+    Type: String
+    Default: 'buildsomething.io.'
+  DomainName:
+    Description: 'Fully Qualified Domain Name'
+    Type: String
+    Default: 'jumpbox.buildsomething.io'
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+Resources:
+ EIP:
+    Type: 'AWS::EC2::EIP'
+    Properties:
+      Domain: vpc
+ Logs:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: !Ref LogsRetentionInDays
+ SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Bastion Security Group'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref HomeNetwork
+      VpcId: !Ref VPC
+ InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref IAMRole
+ IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'ec2.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: 'ec2'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'ec2:AssociateAddress'
+            Resource:
+            - '*'
+      - PolicyName: logs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            - 'logs:DescribeLogStreams'
+            Resource:
+            - 'arn:aws:logs:*:*:*'
+ IAMPolicySSHAccess:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      Roles:
+      - !Ref IAMRole
+      PolicyName: iam
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - 'iam:ListUsers'
+          Resource:
+          - '*'
+        - Effect: Allow
+          Action:
+          - 'iam:ListSSHPublicKeys'
+          - 'iam:GetSSHPublicKey'
+          Resource:
+          - !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+ LaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default:
+            - config
+            - ssh-access
+            - recorder
+        ssh-access:
+          files:
+            '/opt/authorized_keys_command.sh':
+              content: |
+                #!/bin/bash -e
+                if [ -z "$1" ]; then
+                  exit 1
+                fi
+                SaveUserName="$1"
+                aws iam list-ssh-public-keys --user-name "$SaveUserName" --query "SSHPublicKeys[?Status == 'Active'].[SSHPublicKeyId]" --output text | while read KeyId; do
+                  aws iam get-ssh-public-key --user-name "$SaveUserName" --ssh-public-key-id "$KeyId" --encoding SSH --query "SSHPublicKey.SSHPublicKeyBody" --output text
+                done
+              mode: '000755'
+              owner: root
+              group: root
+            '/opt/import_users.sh':
+              content: |
+                #!/bin/bash -e
+                aws iam list-users --query "Users[].[UserName]" --output text | while read User; do
+                  SaveUserName="$User"
+                  if ! id -u "$SaveUserName" >/dev/null 2>&1; then
+                    # don't grant sudo rights on bastion host!
+                    /usr/sbin/useradd "$SaveUserName" && \
+                    mkdir -m 700 /home/$SaveUserName/.ssh && \
+                    chown $SaveUserName /home/$SaveUserName/.ssh && \
+                    KeyId="$(aws iam list-ssh-public-keys --user-name "$SaveUserName" --output text|awk '{print $2}')"
+                    PrivateKey="$(aws iam get-ssh-public-key --user-name "$SaveUserName" --ssh-public-key-id "$KeyId" --encoding SSH --query "SSHPublicKey.SSHPublicKeyBody" --output text)"
+                    mkdir /home/$SaveUserName/.ssh/autorized_keys
+                    echo $PrivateKey >> /home/$SaveUserName/.ssh/autorized_keys/$SaveUserName.key
+                    chmod 600 /home/$SaveUserName/.ssh/autorized_keys
+                    chown $SaveUserName:$SaveUserName /home/$SaveUserName/.ssh/autorized_keys
+                  fi
+                done
+              mode: '000755'
+              owner: root
+              group: root
+            '/etc/cron.d/import_users':
+              content: |
+                */1 * * * * root /opt/import_users.sh #update to every minutes
+              mode: '000644'
+              owner: root
+              group: root
+          commands:
+            'a_configure_sshd_command':
+              command: 'sed -i "s:#AuthorizedKeysCommand none:AuthorizedKeysCommand /opt/authorized_keys_command.sh:g" /etc/ssh/sshd_config'
+            'b_configure_sshd_commanduser':
+              command: 'sed -i "s:#AuthorizedKeysCommandUser nobody:AuthorizedKeysCommandUser nobody:g" /etc/ssh/sshd_config'
+            'c_import_users':
+              command: './import_users.sh'
+              cwd: '/opt'
+          services:
+            sysvinit:
+              sshd:
+                enabled: true
+                ensureRunning: true
+                commands:
+                - 'a_configure_sshd_command'
+                - 'b_configure_sshd_commanduser'
+        config:
+          packages:
+            yum:
+              awslogs: []
+          files:
+            '/etc/awslogs/awscli.conf':
+              content: !Sub |
+                [default]
+                region = ${AWS::Region}
+                [plugins]
+                cwlogs = cwlogs
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/awslogs/awslogs.conf':
+              content: !Sub |
+                [general]
+                state_file = /var/lib/awslogs/agent-state
+                [/var/log/messages]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/messages
+                log_stream_name = {instance_id}/var/log/messages
+                log_group_name = ${Logs}
+                [/var/log/secure]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/secure
+                log_stream_name = {instance_id}/var/log/secure
+                log_group_name = ${Logs}
+                [/var/log/cron]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cron
+                log_stream_name = {instance_id}/var/log/cron
+                log_group_name = ${Logs}
+                [/var/log/cloud-init.log]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cloud-init.log
+                log_stream_name = {instance_id}/var/log/cloud-init.log
+                log_group_name = ${Logs}
+                [/var/log/cfn-init.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init.log
+                log_stream_name = {instance_id}/var/log/cfn-init.log
+                log_group_name = ${Logs}
+                [/var/log/cfn-hup.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-hup.log
+                log_stream_name = {instance_id}/var/log/cfn-hup.log
+                log_group_name = ${Logs}
+                [/var/log/cfn-init-cmd.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init-cmd.log
+                log_stream_name = {instance_id}/var/log/cfn-init-cmd.log
+                log_group_name = ${Logs}
+                [/var/log/cloud-init-output.log]
+                file = /var/log/cloud-init-output.log
+                log_stream_name = {instance_id}/var/log/cloud-init-output.log
+                log_group_name = ${Logs}
+                [/var/log/dmesg]
+                file = /var/log/dmesg
+                log_stream_name = {instance_id}/var/log/dmesg
+                log_group_name = ${Logs}
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack=${AWS::StackName} --region=${AWS::Region} --resource=LaunchConfiguration
+                runas=root
+          services:
+            sysvinit:
+              awslogs:
+                enabled: true
+                ensureRunning: true
+                packages:
+                  yum:
+                  - awslogs
+                files:
+                - '/etc/awslogs/awslogs.conf'
+                - '/etc/awslogs/awscli.conf'
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                - '/etc/cfn/cfn-hup.conf'
+                - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
+        recorder:
+          files:
+            '/opt/configure.sh':
+              content: |
+                #!/bin/bash -e
+                # Create a new folder for the log files
+                mkdir /var/log/bastion
+
+                # Allow ec2-user only to access this folder and its content
+                chown ec2-user:ec2-user /var/log/bastion
+                chmod -R 770 /var/log/bastion
+                setfacl -Rdm other:0 /var/log/bastion
+
+                # Make OpenSSH execute a custom script on logins
+                echo -e "\nForceCommand /usr/bin/bastion/shell" >> /etc/ssh/sshd_config
+
+                # Block some SSH features that bastion host users could use to circumvent
+                # the solution
+                awk '!/AllowTcpForwarding/' /etc/ssh/sshd_config > temp && mv temp /etc/ssh/sshd_config
+                awk '!/X11Forwarding/' /etc/ssh/sshd_config > temp && mv temp /etc/ssh/sshd_config
+                echo "AllowTcpForwarding no" >> /etc/ssh/sshd_config
+                echo "X11Forwarding no" >> /etc/ssh/sshd_config
+
+                mkdir /usr/bin/bastion
+
+                cat > /usr/bin/bastion/shell << 'EOF'
+
+                # Check that the SSH client did not supply a command
+                if [[ -z $SSH_ORIGINAL_COMMAND ]]; then
+
+                  # The format of log files is /var/log/bastion/YYYY-MM-DD_HH-MM-SS_user
+                  LOG_FILE="`date --date="today" "+%Y-%m-%d_%H-%M-%S"`_`whoami`"
+                  LOG_DIR="/var/log/bastion/"
+
+                  # Print a welcome message
+                  echo ""
+                  echo "*********WARNING*********"
+                  echo "This computer system is for authroized use only.  By using this system, all users acknoledge notice of, and agree to comply with, the Acceptable Use of Inforamtion Technology Resouces Policy governing access to this system.  Unauthorized or improper use of this system may result in disciplinary action, civil charges/criminal penalties, and/or other sanctions.  By continuing to use this system you indicate your awareness and conset to these terms and conditions of use."
+                  echo "LOG OFF IMMEDIATELY if you do not agree to the conditions stated in this warning."
+                  echo "**************************"
+                  echo "NOTE: This SSH session will be recorded"
+                  echo "AUDIT KEY: $LOG_FILE"
+                  echo ""
+
+                  # I suffix the log file name with a random string. I explain why
+                  # later on.
+                  SUFFIX=`mktemp -u _XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`
+
+                  # Wrap an interactive shell into "script" to record the SSH session
+                  script -qf --timing=$LOG_DIR$LOG_FILE$SUFFIX.time $LOG_DIR$LOG_FILE$SUFFIX.data --command=/bin/bash
+
+                else
+
+                  # The "script" program could be circumvented with some commands
+                  # (e.g. bash, nc). Therefore, I intentionally prevent users
+                  # from supplying commands.
+
+                  echo "This bastion supports interactive sessions only. Do not supply a command"
+                  exit 1
+
+                fi
+
+                EOF
+
+                # Make the custom script executable
+                chmod a+x /usr/bin/bastion/shell
+
+                # Bastion host users could overwrite and tamper with an existing log file
+                # using "script" if they knew the exact file name. I take several measures
+                # to obfuscate the file name:
+                # 1. Add a random suffix to the log file name.
+                # 2. Prevent bastion host users from listing the folder containing log
+                # files.
+                # This is done by changing the group owner of "script" and setting GID.
+                chown root:ec2-user /usr/bin/script
+                chmod g+s /usr/bin/script
+
+                # 3. Prevent bastion host users from viewing processes owned by other
+                # users, because the log file name is one of the "script"
+                # execution parameters.
+                mount -o remount,rw,hidepid=2 /proc
+                awk '!/proc/' /etc/fstab > temp && mv temp /etc/fstab
+                echo "proc /proc proc defaults,hidepid=2 0 0" >> /etc/fstab
+
+                # Restart the SSH service to apply /etc/ssh/sshd_config modifications.
+                service sshd restart
+              mode: '000755'
+              owner: root
+              group: root
+            '/opt/backup.sh':
+               content: |
+                #!/bin/bash -e
+                cat > /usr/bin/bastion/sync_s3 << 'EOF'
+                # Copy log files to S3 with server-side encryption enabled.
+                # Then, if successful, delete log files that are older than a day.
+                LOG_DIR="/var/log/bastion/"
+                aws s3 cp $LOG_DIR s3://${RecorderBucket} --sse --region region --recursive && find $LOG_DIR* -mtime +1 -exec rm {} \;
+
+                EOF
+
+                chmod 700 /usr/bin/bastion/sync_s3
+               mode: '000755'
+               owner: root
+               group: root
+          commands:
+            'a_run_configure':
+              command: './opt/configure.sh'
+            'b_run_backup':
+              command: './opt/backup.sh'
+            'c_run_schedule_1':
+              command: '(crontab -l; echo "*/5 * * * * /usr/bin/bastion/sync_s3")|crontab'
+            'd_run_schedule_2':
+              command: '(crontabl -l; echo "0 0 * * * yum -y update --security")|crontab'
+    Properties:
+      AssociatePublicIpAddress: true
+      EbsOptimized: false
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref AMI
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+      - !Ref SecurityGroup
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -x
+          INSTANCEID=$(curl -s -m 60 http://169.254.169.254/latest/meta-data/instance-id)
+          aws --region ${AWS::Region} ec2 associate-address --instance-id $INSTANCEID --allocation-id ${EIP.AllocationId} && /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfiguration --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+ AutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      DesiredCapacity: 1
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MaxSize: 1
+      MinSize: 1
+      Tags:
+      - Key: Name
+        Value: 'bastion'
+        PropagateAtLaunch: true
+      VPCZoneIdentifier:
+      - !Ref SubnetA
+      - !Ref SubnetB
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+ DNSRecord:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneName: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: "A"
+      TTL: "900"
+      ResourceRecords:
+      - !Ref EIP
+ ArchiveRecorderBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: LogDeliveryWrite
+      LifecycleConfiguration:
+        Rules:
+        - Id: Transition90daysRetain7yrs
+          Status: Enabled
+          ExpirationInDays: '2555'
+          Transition:
+            TransitionInDays: '90'
+            StorageClass: "GLACIER"
+      VersioningConfiguration:
+        Status: Enabled
+ ArchiveLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: ArchiveRecorderBucket
+    Properties:
+      Bucket: !Ref ArchiveRecorderBucket
+      PolicyDocument:
+        Statement:
+        - Sid: Enforce HTTPS Connections
+          Action: s3:*
+          Effect: Deny
+          Principal: "*"
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: ArchiveRecorderBucket
+              - "/*"
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+        - Sid: Restrict Delete* Actions
+          Action: s3:Delete*
+          Effect: Deny
+          Principal: "*"
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: ArchiveRecorderBucket
+              - "/*"
+        - Sid: DenyUnEncryptedObjectUploads
+          Effect: Deny
+          Principal: "*"
+          Action: s3:PutObject
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: ArchiveRecorderBucket
+              - "/*"
+          Condition:
+            StringNotEquals:
+              s3:x-amz-server-side-encryption: AES256
+ RedcorderBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref ArchiveRecorderBucket
+        LogFilePrefix: bastionlog
+ RecorderS3Policy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: RedcorderBucket
+    Properties:
+      Bucket: !Ref RedcorderBucket
+      PolicyDocument:
+        Statement:
+        - Sid: AWSBastionRecoderAclCheck20150319
+          Effect: Allow
+          Principal: '*'
+          Action: s3:GetBucketAcl
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: RedcorderBucket
+        - Sid: AWSCloudTrailWrite20150319
+          Effect: Allow
+          Principal: '*'
+          Action: s3:PutObject
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: RedcorderBucket
+              - "/*"
+          Condition:
+            StringEquals:
+              s3:x-amz-acl: bucket-owner-full-control
+        - Sid: Enforce HTTPS Connections
+          Action: s3:*
+          Effect: Deny
+          Principal: "*"
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: RedcorderBucket
+              - "/*"
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+        - Sid: Restrict Delete* Actions
+          Action: s3:Delete*
+          Effect: Deny
+          Principal: "*"
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: RedcorderBucket
+              - "/*"
+        - Sid: DenyUnEncryptedObjectUploads
+          Effect: Deny
+          Principal: "*"
+          Action: s3:PutObject
+          Resource:
+          - Fn::Join:
+            - ''
+            - - 'arn:'
+              - aws
+              - ":s3:::"
+              - Ref: RedcorderBucket
+              - "/*"
+          Condition:
+            StringNotEquals:
+              s3:x-amz-server-side-encryption: AES256
+Outputs:
+  IPAddress:
+    Description: 'The public IP address of the SSH bastion host/instance.'
+    Value: !Ref EIP
+    Export:
+      Name: !Sub '${AWS::StackName}-IPAddress'
